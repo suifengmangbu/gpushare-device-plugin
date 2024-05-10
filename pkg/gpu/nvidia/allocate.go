@@ -49,7 +49,7 @@ func (m *NvidiaDevicePlugin) Allocate(ctx context.Context,
 		found     bool
 		assumePod *v1.Pod
 	)
-	log.Infof("ContainerRequests: %+v", reqs.ContainerRequest)
+	log.Infof("ContainerRequests: %v", reqs.ContainerRequest)
 	// podReqGPU = uint(0)
 	for _, req := range reqs.ContainerRequests {
 		podReqGPU += uint(len(req.DevicesIDs))
