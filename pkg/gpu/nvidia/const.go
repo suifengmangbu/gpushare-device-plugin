@@ -13,6 +13,9 @@ const (
 	serverSock    = pluginapi.DevicePluginPath + "aliyungpushare.sock"
 
 	OptimisticLockErrorMsg = "the object has been modified; please apply your changes to the latest version and try again"
+	//添加一个标签，便于快速检索有申请gpu资源且分配成功的POD
+	podGpuResourceLabelKey   = "gpu/resource"
+	podGpuResourceLabelValue = "gpu-mem"
 
 	allHealthChecks             = "xids"
 	containerTypeLabelKey       = "io.kubernetes.docker.type"

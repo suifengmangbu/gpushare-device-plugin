@@ -98,6 +98,22 @@ func patchGPUCount(gpuCount int) error {
 	return err
 }
 
+// 获取所有Pod使用的gpu及显存大小
+func getPodUsedGPUMemory() (usedGPUs map[int]uint, err error) {
+	usedGPUs = map[int]uint{}
+	podList, err := getUseGpuMemoryPodsInNode()
+	if err != nil {
+		return usedGPUs, err
+	}
+	for _, pod := range podList {
+		current := pod
+		deviceIndex := getGPUIDFromPodAnnotation(&current)
+		useGpuMem := getGPUMemoryFromPodResource(&current)
+		usedGPUs[deviceIndex] += useGpuMem
+	}
+	return usedGPUs, nil
+}
+
 func getPodList(kubeletClient *client.KubeletClient) (*v1.PodList, error) {
 	podList, err := kubeletClient.GetNodeRunningPods()
 	if err != nil {
@@ -105,7 +121,7 @@ func getPodList(kubeletClient *client.KubeletClient) (*v1.PodList, error) {
 	}
 
 	list, _ := json.Marshal(podList)
-	log.V(8).Infof("get pods list %v", string(list))
+	log.V(6).Infof("get pods list %v", string(list))
 
 	resultPodList := &v1.PodList{}
 	for _, metaPod := range podList.Items {
@@ -131,7 +147,8 @@ func getPodListsByQueryKubelet(kubeletClient *client.KubeletClient) (*v1.PodList
 	}
 	if err != nil {
 		log.Warningf("not found from kubelet /pods api, start to list apiserver")
-		podList, err = getPodListsByListAPIServer()
+		fieldSelector := fields.SelectorFromSet(fields.Set{"spec.nodeName": nodeName, "status.phase": "Pending"})
+		podList, err = getPodListsByListAPIServer(fieldSelector, labels.Everything())
 		if err != nil {
 			return nil, err
 		}
@@ -139,16 +156,15 @@ func getPodListsByQueryKubelet(kubeletClient *client.KubeletClient) (*v1.PodList
 	return podList, nil
 }
 
-func getPodListsByListAPIServer() (*v1.PodList, error) {
-	selector := fields.SelectorFromSet(fields.Set{"spec.nodeName": nodeName, "status.phase": "Pending"})
+func getPodListsByListAPIServer(fieldSelector fields.Selector, labelSelector labels.Selector) (*v1.PodList, error) {
 	podList, err := clientset.CoreV1().Pods(v1.NamespaceAll).List(metav1.ListOptions{
-		FieldSelector: selector.String(),
-		LabelSelector: labels.Everything().String(),
+		FieldSelector: fieldSelector.String(),
+		LabelSelector: labelSelector.String(),
 	})
 	for i := 0; i < 3 && err != nil; i++ {
 		podList, err = clientset.CoreV1().Pods(v1.NamespaceAll).List(metav1.ListOptions{
-			FieldSelector: selector.String(),
-			LabelSelector: labels.Everything().String(),
+			FieldSelector: fieldSelector.String(),
+			LabelSelector: labelSelector.String(),
 		})
 		time.Sleep(1 * time.Second)
 	}
@@ -160,12 +176,7 @@ func getPodListsByListAPIServer() (*v1.PodList, error) {
 }
 
 func getPendingPodsInNode(queryKubelet bool, kubeletClient *client.KubeletClient) ([]v1.Pod, error) {
-	// pods, err := m.lister.List(labels.Everything())
-	// if err != nil {
-	// 	return nil, err
-	// }
 	pods := []v1.Pod{}
-
 	podIDMap := map[types.UID]bool{}
 
 	var podList *v1.PodList
@@ -176,15 +187,15 @@ func getPendingPodsInNode(queryKubelet bool, kubeletClient *client.KubeletClient
 			return nil, err
 		}
 	} else {
-		podList, err = getPodListsByListAPIServer()
+		fieldSelector := fields.SelectorFromSet(fields.Set{"spec.nodeName": nodeName, "status.phase": "Pending"})
+		podList, err = getPodListsByListAPIServer(fieldSelector, labels.Everything())
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	log.V(5).Infof("all pod list %v", podList.Items)
+	log.V(6).Infof("all pending pod list %v", podList.Items)
 
-	// if log.V(5) {
 	for _, pod := range podList.Items {
 		if pod.Spec.NodeName != nodeName {
 			log.Warningf("Pod name %s in ns %s is not assigned to node %s as expected, it's placed on node %s ",
@@ -193,7 +204,7 @@ func getPendingPodsInNode(queryKubelet bool, kubeletClient *client.KubeletClient
 				nodeName,
 				pod.Spec.NodeName)
 		} else {
-			log.Infof("list pod %s in ns %s in node %s and status is %s",
+			log.V(6).Infof("list pod %s in ns %s in node %s and status is %s",
 				pod.Name,
 				pod.Namespace,
 				nodeName,
@@ -206,8 +217,29 @@ func getPendingPodsInNode(queryKubelet bool, kubeletClient *client.KubeletClient
 		}
 
 	}
-	// }
+	return pods, nil
+}
 
+// 获取使用GPU显存资源的POD
+func getUseGpuMemoryPodsInNode() ([]v1.Pod, error) {
+	pods := []v1.Pod{}
+	// 定义筛选条件 todo：目前只取Running状态的，可能不完整
+	fieldSelector := fields.SelectorFromSet(fields.Set{"spec.nodeName": nodeName, "status.phase": "Running"})
+	// 定义要筛选的标签
+	labelSelector := labels.Set{podGpuResourceLabelKey: podGpuResourceLabelValue}.AsSelector()
+	podList, err := getPodListsByListAPIServer(fieldSelector, labelSelector)
+	if err != nil {
+		return pods, err
+	}
+	log.V(6).Infof("use gpu memory pod num %d", len(podList.Items))
+	podIDMap := map[types.UID]bool{}
+	for _, pod := range podList.Items {
+		if _, ok := podIDMap[pod.UID]; !ok {
+			log.V(6).Infof("list use gpu memory pod : %v", pod.Name)
+			pods = append(pods, pod)
+			podIDMap[pod.UID] = true
+		}
+	}
 	return pods, nil
 }
 
@@ -220,26 +252,25 @@ func getCandidatePods(queryKubelet bool, client *client.KubeletClient) ([]*v1.Po
 	}
 	for _, pod := range allPods {
 		current := pod
-		if isGPUMemoryAssumedPod(&current) {
+		// determine if the pod is GPU share pod
+		if !isGPUSharePod(&current) {
+			continue
+		}
+		//determine if the pod is already assumed
+		if isGPUShareAssumedPod(&current) {
+			if !isGPUShareAssignedPod(&current) {
+				candidatePods = append(candidatePods, &current)
+			}
+		} else {
 			candidatePods = append(candidatePods, &current)
 		}
 	}
-
-	if log.V(4) {
-		for _, pod := range candidatePods {
-			log.Infof("candidate pod %s in ns %s with timestamp %d is found.",
-				pod.Name,
-				pod.Namespace,
-				getAssumeTimeFromPodAnnotation(pod))
-		}
-	}
-
 	return makePodOrderdByAge(candidatePods), nil
 }
 
 // make the pod ordered by GPU assumed time
 func makePodOrderdByAge(pods []*v1.Pod) []*v1.Pod {
-	newPodList := make(orderedPodByAssumeTime, 0, len(pods))
+	newPodList := make(orderedPodByCreateTime, 0, len(pods))
 	for _, v := range pods {
 		newPodList = append(newPodList, v)
 	}
@@ -247,16 +278,16 @@ func makePodOrderdByAge(pods []*v1.Pod) []*v1.Pod {
 	return []*v1.Pod(newPodList)
 }
 
-type orderedPodByAssumeTime []*v1.Pod
+type orderedPodByCreateTime []*v1.Pod
 
-func (this orderedPodByAssumeTime) Len() int {
+func (this orderedPodByCreateTime) Len() int {
 	return len(this)
 }
 
-func (this orderedPodByAssumeTime) Less(i, j int) bool {
-	return getAssumeTimeFromPodAnnotation(this[i]) <= getAssumeTimeFromPodAnnotation(this[j])
+func (this orderedPodByCreateTime) Less(i, j int) bool {
+	return getCreateTimeFromPod(this[i]).Before(getCreateTimeFromPod(this[j]))
 }
 
-func (this orderedPodByAssumeTime) Swap(i, j int) {
+func (this orderedPodByCreateTime) Swap(i, j int) {
 	this[i], this[j] = this[j], this[i]
 }

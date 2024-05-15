@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path"
+	"sort"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ type NvidiaDevicePlugin struct {
 	realDevNames         []string
 	devNameMap           map[string]uint
 	devIndxMap           map[uint]string
+	devMemMap            map[int]uint
 	socket               string
 	mps                  bool
 	healthCheck          bool
@@ -36,7 +38,7 @@ type NvidiaDevicePlugin struct {
 
 // NewNvidiaDevicePlugin returns an initialized NvidiaDevicePlugin
 func NewNvidiaDevicePlugin(mps, healthCheck, queryKubelet bool, client *client.KubeletClient) (*NvidiaDevicePlugin, error) {
-	devs, devNameMap := getDevices()
+	devs, devNameMap, devMemMap := getDevices()
 	devList := []string{}
 
 	for dev, _ := range devNameMap {
@@ -45,6 +47,7 @@ func NewNvidiaDevicePlugin(mps, healthCheck, queryKubelet bool, client *client.K
 
 	log.Infof("Device Map: %v", devNameMap)
 	log.Infof("Device List: %v", devList)
+	log.Infof("Device Memory: %v", devMemMap)
 
 	err := patchGPUCount(len(devList))
 	if err != nil {
@@ -58,6 +61,7 @@ func NewNvidiaDevicePlugin(mps, healthCheck, queryKubelet bool, client *client.K
 		devs:                 devs,
 		realDevNames:         devList,
 		devNameMap:           devNameMap,
+		devMemMap:            devMemMap,
 		socket:               serverSock,
 		mps:                  mps,
 		healthCheck:          healthCheck,
@@ -238,4 +242,48 @@ func (m *NvidiaDevicePlugin) Serve() error {
 	log.Infoln("Registered device plugin with Kubelet")
 
 	return nil
+}
+
+// 为请求的GPU资源分配一个合适的设备。
+// 返回值:如果找到满足条件的设备，返回其索引；如果没有找到，则返回-1。
+func (m *NvidiaDevicePlugin) assignDevice(availableGPUs map[int]uint, reqGPU uint) (devIdx int) {
+	keys := make([]int, 0, len(m.devMemMap))
+	for key, _ := range m.devMemMap {
+		keys = append(keys, key)
+	}
+	sort.Ints(keys)
+	for _, devID := range keys {
+		availableGPU, ok := availableGPUs[devID]
+		if ok {
+			if availableGPU >= reqGPU {
+				return devID
+			}
+		}
+	}
+	return -1
+}
+
+// 获取当前节点上可用的GPU列表，返回：设备序号->可用显存大小
+// TODO:健康检查异常的设备在当前实现中不被考虑
+func (m *NvidiaDevicePlugin) getAvailableGPUs() (availableGPUs map[int]uint) {
+	availableGPUs = map[int]uint{}
+	// 获取已使用的GPU显存大小。
+	usedGPUs, err := getPodUsedGPUMemory()
+	if err != nil {
+		return availableGPUs
+	}
+
+	log.V(6).Infof("total GPU : %v", m.devMemMap)
+	log.V(6).Infof("used GPU : %v", usedGPUs)
+	// 遍历所有GPU，计算每个设备可用显存
+	for id, totalGPUMem := range m.devMemMap {
+		if usedGPUMem, found := usedGPUs[id]; found {
+			availableGPUs[id] = totalGPUMem - usedGPUMem
+		} else {
+			availableGPUs[id] = totalGPUMem
+		}
+	}
+	// 打印可用GPU列表，在移除不健康的GPU之前
+	log.V(6).Infof("available GPU list %v before removing unhealty GPUs", availableGPUs)
+	return availableGPUs
 }

@@ -1,5 +1,7 @@
 FROM golang:1.10-stretch as build
 
+ENV GOPROXY=https://goproxy.cn,direct
+
 WORKDIR /go/src/github.com/AliyunContainerService/gpushare-device-plugin
 COPY . .
 

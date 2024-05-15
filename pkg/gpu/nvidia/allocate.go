@@ -1,7 +1,9 @@
 package nvidia
 
 import (
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	log "github.com/golang/glog"
@@ -21,63 +23,34 @@ func init() {
 	kubeInit()
 }
 
-func buildErrResponse(reqs *pluginapi.AllocateRequest, podReqGPU uint) *pluginapi.AllocateResponse {
-	responses := pluginapi.AllocateResponse{}
-	for _, req := range reqs.ContainerRequests {
-		response := pluginapi.ContainerAllocateResponse{
-			Envs: map[string]string{
-				envNVGPU:               fmt.Sprintf("no-gpu-has-%d%s-to-run", podReqGPU, metric),
-				EnvResourceIndex:       fmt.Sprintf("-1"),
-				EnvResourceByPod:       fmt.Sprintf("%d", podReqGPU),
-				EnvResourceByContainer: fmt.Sprintf("%d", uint(len(req.DevicesIDs))),
-				EnvResourceByDev:       fmt.Sprintf("%d", getGPUMemory()),
-			},
-		}
-		responses.ContainerResponses = append(responses.ContainerResponses, &response)
-	}
-	return &responses
-}
-
 // Allocate which return list of devices.
 func (m *NvidiaDevicePlugin) Allocate(ctx context.Context,
 	reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	responses := pluginapi.AllocateResponse{}
 
-	log.Infoln("----Allocating GPU for gpu mem is started----")
 	var (
 		podReqGPU uint
 		found     bool
 		assumePod *v1.Pod
 	)
-	log.Infof("ContainerRequests: %+v", reqs.ContainerRequest)
-	// podReqGPU = uint(0)
+	log.V(6).Infof("Allocate GPU for gpu mem :: ContainerRequests: %v", reqs.ContainerRequests)
 	for _, req := range reqs.ContainerRequests {
 		podReqGPU += uint(len(req.DevicesIDs))
 	}
-	log.Infof("RequestPodGPUs: %d", podReqGPU)
+	log.V(6).Infof("Allocate GPU for gpu mem :: RequestPodGPUs: %d", podReqGPU)
 
 	m.Lock()
 	defer m.Unlock()
-	log.Infoln("checking...")
-	pods, err := getCandidatePods(m.queryKubelet, m.kubeletClient)
+	log.V(6).Infoln("checking...")
+	//获取所有状态为pending的Pod
+	candidatePods, err := getCandidatePods(m.queryKubelet, m.kubeletClient)
 	if err != nil {
-		log.Infof("invalid allocation requst: Failed to find candidate pods due to %v", err)
-		return buildErrResponse(reqs, podReqGPU), nil
+		log.Errorf("invalid allocation requst: failed to find candidate pods due to %v", err)
+		return nil, fmt.Errorf("failed to find candidate pods due to %v", err)
 	}
-
-	if log.V(4) {
-		for _, pod := range pods {
-			log.Infof("Pod %s in ns %s request GPU Memory %d with timestamp %v",
-				pod.Name,
-				pod.Namespace,
-				getGPUMemoryFromPodResource(pod),
-				getAssumeTimeFromPodAnnotation(pod))
-		}
-	}
-
-	for _, pod := range pods {
+	for _, pod := range candidatePods {
 		if getGPUMemoryFromPodResource(pod) == podReqGPU {
-			log.Infof("Found Assumed GPU shared Pod %s in ns %s with GPU Memory %d",
+			log.V(6).Infof("Found GPU shared Pod %s in ns %s with GPU Memory %d",
 				pod.Name,
 				pod.Namespace,
 				podReqGPU)
@@ -86,113 +59,92 @@ func (m *NvidiaDevicePlugin) Allocate(ctx context.Context,
 			break
 		}
 	}
-
-	if found {
-		id := getGPUIDFromPodAnnotation(assumePod)
-		if id < 0 {
-			log.Warningf("Failed to get the dev ", assumePod)
+	if !found {
+		log.Errorf("not found gpu shared pod need allocate gpu device")
+		return nil, fmt.Errorf("not found gpu shared pod need allocate gpu device")
+	}
+	var devIdx int
+	patchData := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]string{},
+			"labels": map[string]string{
+				podGpuResourceLabelKey: podGpuResourceLabelValue,
+			},
+		},
+	}
+	if isGPUShareAssumedPod(assumePod) {
+		devIdx = getGPUIDFromPodAnnotation(assumePod)
+		if devIdx < 0 {
+			log.Errorf("failed to get dev index for pod %v", assumePod.Name)
+			return nil, fmt.Errorf("failed to get dev index")
 		}
-
-		candidateDevID := ""
-		if id >= 0 {
-			ok := false
-			candidateDevID, ok = m.GetDeviceNameByIndex(uint(id))
-			if !ok {
-				log.Warningf("Failed to find the dev for pod %v because it's not able to find dev with index %d",
-					assumePod,
-					id)
-				id = -1
-			}
-		}
-
-		if id < 0 {
-			return buildErrResponse(reqs, podReqGPU), nil
-		}
-		log.Infof("gpu index %v,uuid: %v", id, candidateDevID)
-		// 1. Create container requests
-		for _, req := range reqs.ContainerRequests {
-			reqGPU := uint(len(req.DevicesIDs))
-			response := pluginapi.ContainerAllocateResponse{
-				Envs: map[string]string{
-					envNVGPU:               fmt.Sprintf("%v", id),
-					EnvResourceIndex:       fmt.Sprintf("%d", id),
-					EnvResourceByPod:       fmt.Sprintf("%d", podReqGPU),
-					EnvResourceByContainer: fmt.Sprintf("%d", reqGPU),
-					EnvResourceByDev:       fmt.Sprintf("%d", getGPUMemory()),
-				},
-			}
-			if m.disableCGPUIsolation {
-				response.Envs["CGPU_DISABLE"] = "true"
-			}
-			responses.ContainerResponses = append(responses.ContainerResponses, &response)
-		}
-
-		// 2. Update Pod spec
-		patchedAnnotationBytes, err := patchPodAnnotationSpecAssigned()
-		if err != nil {
-			return buildErrResponse(reqs, podReqGPU), nil
-		}
-		_, err = clientset.CoreV1().Pods(assumePod.Namespace).Patch(assumePod.Name, types.StrategicMergePatchType, patchedAnnotationBytes)
-		if err != nil {
-			// the object has been modified; please apply your changes to the latest version and try again
-			if err.Error() == OptimisticLockErrorMsg {
-				// retry
-				_, err = clientset.CoreV1().Pods(assumePod.Namespace).Patch(assumePod.Name, types.StrategicMergePatchType, patchedAnnotationBytes)
-				if err != nil {
-					log.Warningf("Failed due to %v", err)
-					return buildErrResponse(reqs, podReqGPU), nil
-				}
-			} else {
-				log.Warningf("Failed due to %v", err)
-				return buildErrResponse(reqs, podReqGPU), nil
-			}
-		}
-
-	} else if len(m.devNameMap) == 1 {
-		var devName string
-		var devIndex uint
-		for d, index := range m.devNameMap {
-			devName = d
-			devIndex = index
-			break
-		}
-		log.Infof("this node has only one gpu device,skip to search pod and directly specify the device  %v(%v) for container", devIndex, devName)
-		for _, req := range reqs.ContainerRequests {
-			reqGPU := uint(len(req.DevicesIDs))
-			response := pluginapi.ContainerAllocateResponse{
-				Envs: map[string]string{
-					envNVGPU:               devName,
-					EnvResourceIndex:       fmt.Sprintf("%d", devIndex),
-					EnvResourceByPod:       fmt.Sprintf("%d", podReqGPU),
-					EnvResourceByContainer: fmt.Sprintf("%d", reqGPU),
-					EnvResourceByDev:       fmt.Sprintf("%d", getGPUMemory()),
-				},
-			}
-			if m.disableCGPUIsolation {
-				response.Envs["CGPU_DISABLE"] = "true"
-			}
-			responses.ContainerResponses = append(responses.ContainerResponses, &response)
-		}
-		log.Infof("get allocated GPUs info %v", responses)
-		return &responses, nil
-
+		// patch 数据
+		annotations := patchData["metadata"].(map[string]interface{})["annotations"].(map[string]string)
+		annotations[EnvAssignedFlag] = "true"
+		annotations[EnvResourceAssumeTime] = fmt.Sprintf("%d", time.Now().UnixNano())
 	} else {
-		log.Warningf("invalid allocation requst: request GPU memory %d can't be satisfied.",
-			podReqGPU)
-		// return &responses, fmt.Errorf("invalid allocation requst: request GPU memory %d can't be satisfied", reqGPU)
-		return buildErrResponse(reqs, podReqGPU), nil
+		log.V(6).Infof("pod %v unscheduler,directly specify the device", assumePod.Name)
+		availableGPUs := m.getAvailableGPUs()
+		devIdx = m.assignDevice(availableGPUs, podReqGPU)
+		if devIdx < 0 {
+			log.Errorf("assign dev for pod %v fail,due to devices unavailable, Requested: %d, Available: %v", assumePod.Name, podReqGPU, availableGPUs)
+			return nil, fmt.Errorf("devices unavailable, Requested: %d, Available: %v", podReqGPU, availableGPUs)
+		}
+		// patch 数据
+		annotations := patchData["metadata"].(map[string]interface{})["annotations"].(map[string]string)
+		annotations[EnvResourceIndex] = strconv.Itoa(devIdx)
+		annotations[EnvResourceByDev] = strconv.Itoa(int(getGPUMemory()))
+		annotations[EnvResourceByPod] = strconv.Itoa(int(podReqGPU))
 	}
-
-	podName := ""
-	if assumePod != nil {
-		podName = assumePod.Name
+	//1.获取设备序号
+	deviceId, ok := m.GetDeviceNameByIndex(uint(devIdx))
+	if !ok {
+		log.Errorf("failed to find the dev for pod %v because it's not able to find dev with index %d",
+			assumePod.Name,
+			devIdx)
+		return nil, fmt.Errorf("not able to find dev with index %d", devIdx)
 	}
-	log.Infof("pod %v, new allocated GPUs info %v", podName, &responses)
-	log.Infof("----Allocating GPU for gpu mem for %v is ended----", podName)
-	// // Add this to make sure the container is created at least
-	// currentTime := time.Now()
-
-	// currentTime.Sub(lastAllocateTime)
-
+	log.V(6).Infof("allocate gpu index %v,uuid: %v", devIdx, deviceId)
+	// 2. Create container requests
+	for _, req := range reqs.ContainerRequests {
+		reqGPU := uint(len(req.DevicesIDs))
+		response := pluginapi.ContainerAllocateResponse{
+			Envs: map[string]string{
+				envNVGPU:               fmt.Sprintf("%v", devIdx),
+				EnvResourceIndex:       fmt.Sprintf("%d", devIdx),
+				EnvResourceByPod:       fmt.Sprintf("%d", podReqGPU),
+				EnvResourceByContainer: fmt.Sprintf("%d", reqGPU),
+				EnvResourceByDev:       fmt.Sprintf("%d", getGPUMemory()),
+			},
+		}
+		if m.disableCGPUIsolation {
+			response.Envs["CGPU_DISABLE"] = "true"
+		}
+		responses.ContainerResponses = append(responses.ContainerResponses, &response)
+	}
+	// 3. Update Pod spec
+	err = patchPod(assumePod, patchData)
+	if err != nil {
+		log.Errorf("patchPod failed, due to %v", err)
+		return nil, fmt.Errorf("patchPod failed, due to %v", err)
+	}
+	log.V(6).Infof("pod %v, new allocated GPUs info %v", assumePod.Name, responses)
 	return &responses, nil
+}
+
+// 更新Pod信息
+func patchPod(pod *v1.Pod, patchData map[string]interface{}) (err error) {
+	patchDataBytes, err := json.Marshal(patchData)
+	if err != nil {
+		return err
+	}
+	_, err = clientset.CoreV1().Pods(pod.Namespace).Patch(pod.Name, types.StrategicMergePatchType, patchDataBytes)
+	if err != nil {
+		// the object has been modified; please apply your changes to the latest version and try again
+		if err.Error() == OptimisticLockErrorMsg {
+			// retry
+			_, err = clientset.CoreV1().Pods(pod.Namespace).Patch(pod.Name, types.StrategicMergePatchType, patchDataBytes)
+		}
+	}
+	return err
 }

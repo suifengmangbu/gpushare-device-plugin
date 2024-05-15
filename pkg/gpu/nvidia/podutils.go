@@ -8,6 +8,7 @@ import (
 
 	log "github.com/golang/glog"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // update pod env with assigned status
@@ -74,48 +75,52 @@ func getAssumeTimeFromPodAnnotation(pod *v1.Pod) (assumeTime uint64) {
 	return assumeTime
 }
 
-// determine if the pod is GPU share pod, and is already assumed but not assigned
-func isGPUMemoryAssumedPod(pod *v1.Pod) (assumed bool) {
-	log.V(6).Infof("Determine if the pod %v is GPUSharedAssumed pod", pod)
-	var ok bool
+// 从 Pod 中获取创建时间
+func getCreateTimeFromPod(pod *v1.Pod) *metav1.Time {
+	return &pod.CreationTimestamp
+}
 
-	// 1. Check if it's for GPU share
+// determine if the pod is GPU share pod
+func isGPUSharePod(pod *v1.Pod) (isShare bool) {
+	log.V(6).Infof("judge if the pod %v is GPUShare pod", pod.Name)
 	if getGPUMemoryFromPodResource(pod) <= 0 {
-		log.V(6).Infof("Pod %s in namespace %s has not GPU Memory Request, so it's not GPUSharedAssumed assumed pod.",
+		log.V(4).Infof("Pod %s in namespace %s has not GPU Memory Request, so it's not GPUSharedAssumed assumed pod.",
 			pod.Name,
 			pod.Namespace)
-		return assumed
+		return false
 	}
+	return true
+}
 
-	// 2. Check if it already has assume time
-	if _, ok = pod.ObjectMeta.Annotations[EnvResourceAssumeTime]; !ok {
+// determine if the pod is already assumed（has assume time）
+func isGPUShareAssumedPod(pod *v1.Pod) (assumed bool) {
+	log.V(6).Infof("judge if the pod %v is GPUSharedAssumed pod", pod.Name)
+	if _, ok := pod.ObjectMeta.Annotations[EnvResourceAssumeTime]; !ok {
 		log.V(4).Infof("No assume timestamp for pod %s in namespace %s, so it's not GPUSharedAssumed assumed pod.",
 			pod.Name,
 			pod.Namespace)
-		return assumed
+		return false
 	}
+	return true
+}
 
-	// 3. Check if it has been assigned already
-	if assigned, ok := pod.ObjectMeta.Annotations[EnvAssignedFlag]; ok {
-
-		if assigned == "false" {
-			log.V(4).Infof("Found GPUSharedAssumed assumed pod %s in namespace %s.",
+// determine if the pod is already assigned
+func isGPUShareAssignedPod(pod *v1.Pod) (assigned bool) {
+	log.V(6).Infof("judge if the pod %v is GPUSharedAssigned pod", pod.Name)
+	if assignedFlag, ok := pod.ObjectMeta.Annotations[EnvAssignedFlag]; ok {
+		if assignedFlag == "false" {
+			log.V(6).Infof("Found GPUSharedAssumed assumed pod %s in namespace %s.",
 				pod.Name,
 				pod.Namespace)
-			assumed = true
+			assigned = false
 		} else {
-			log.Infof("GPU assigned Flag for pod %s exists in namespace %s and its assigned status is %s, so it's not GPUSharedAssumed assumed pod.",
+			log.V(4).Infof("GPU assigned Flag for pod %s exists in namespace %s and its assigned status is %s, so it's not GPUSharedAssumed assumed pod.",
 				pod.Name,
 				pod.Namespace,
 				assigned)
 		}
-	} else {
-		log.Warningf("No GPU assigned Flag for pod %s in namespace %s, so it's not GPUSharedAssumed assumed pod.",
-			pod.Name,
-			pod.Namespace)
 	}
-
-	return assumed
+	return assigned
 }
 
 // Get GPU Memory of the Pod

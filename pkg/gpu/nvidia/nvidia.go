@@ -50,12 +50,13 @@ func getDeviceCount() uint {
 	return n
 }
 
-func getDevices() ([]*pluginapi.Device, map[string]uint) {
+func getDevices() ([]*pluginapi.Device, map[string]uint, map[int]uint) {
 	n, err := nvml.GetDeviceCount()
 	check(err)
 
 	var devs []*pluginapi.Device
 	realDevNames := map[string]uint{}
+	devMemMap := map[int]uint{}
 	for i := uint(0); i < n; i++ {
 		d, err := nvml.NewDevice(i)
 		check(err)
@@ -70,6 +71,7 @@ func getDevices() ([]*pluginapi.Device, map[string]uint) {
 		if getGPUMemory() == uint(0) {
 			setGPUMemory(uint(*d.Memory))
 		}
+		devMemMap[int(id)] = getGPUMemory()
 		for j := uint(0); j < getGPUMemory(); j++ {
 			fakeID := generateFakeDeviceID(d.UUID, j)
 			if j == 0 {
@@ -85,7 +87,7 @@ func getDevices() ([]*pluginapi.Device, map[string]uint) {
 		}
 	}
 
-	return devs, realDevNames
+	return devs, realDevNames, devMemMap
 }
 
 func deviceExists(devs []*pluginapi.Device, id string) bool {
